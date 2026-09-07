@@ -1,0 +1,176 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i python3 -p python3
+"""Print local Zotero attachment paths without writing to the Zotero database."""
+import argparse
+from contextlib import contextmanager
+import json
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+
+
+def preferences(path):
+    result = {}
+    for name, value in re.findall(
+        r'user_pref\("(extensions\.zotero\.[^"]+)",\s*(.*?)\);',
+        path.read_text(),
+    ):
+        try:
+            result[name.removeprefix('extensions.zotero.')] = json.loads(value)
+        except ValueError:
+            pass
+    return result
+
+
+def configuration(args):
+    profiles = sorted((Path.home() / '.zotero/zotero').glob('*/prefs.js'))
+    if args.prefs:
+        prefs = preferences(args.prefs.expanduser())
+    elif len(profiles) == 1:
+        prefs = preferences(profiles[0])
+    elif len(profiles) > 1 and not args.data_dir:
+        raise ValueError('Multiple Zotero profiles: specify --prefs or --data-dir')
+    else:
+        prefs = {}
+    data = args.data_dir or (
+        prefs.get('dataDir') if prefs.get('useDataDir') else None
+    ) or Path.home() / 'Zotero'
+    base = args.base_dir or prefs.get('baseAttachmentPath')
+    return Path(data).expanduser().resolve(), Path(base).expanduser().resolve() if base else None
+
+
+def signatures(paths):
+    result = []
+    for path in paths:
+        try:
+            s = path.stat()
+            result.append((s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))
+        except FileNotFoundError:
+            result.append(None)
+    return result
+
+
+@contextmanager
+def snapshot(database):
+    # Never give SQLite the original path: even read-only SQLite connections
+    # can create/update WAL shared-memory files. Copy WAL too, not just the DB.
+    sources = [database, Path(str(database) + '-wal'), Path(str(database) + '-journal')]
+    if not database.is_file():
+        raise ValueError(f'Database not found: {database}')
+    with tempfile.TemporaryDirectory(prefix='zotero-attachment-') as directory:
+        target = Path(directory) / 'zotero.sqlite'
+        for attempt in range(5):
+            before = signatures(sources)
+            if before[2] is not None:
+                raise ValueError('Zotero has a rollback journal; close Zotero and retry')
+            try:
+                for source, signature in zip(sources[:2], before[:2]):
+                    destination = Path(directory) / source.name
+                    if signature is not None:
+                        shutil.copyfile(source, destination)
+                    else:
+                        destination.unlink(missing_ok=True)
+            except FileNotFoundError:
+                continue
+            if before == signatures(sources):
+                break
+            time.sleep(0.1)
+        else:
+            raise ValueError('Database is changing; close Zotero and retry')
+        connection = sqlite3.connect(target.as_uri() + '?mode=ro', uri=True)
+        try:
+            connection.execute('PRAGMA query_only=ON')
+            yield connection
+        finally:
+            connection.close()
+
+
+def attachment_paths(connection, identifier, data, base, library_id=None):
+    if identifier.startswith('zotero://select/library/items/'):
+        identifier = identifier.removeprefix('zotero://select/library/items/')
+    library = ('i.libraryID = ?' if library_id is not None else
+               "i.libraryID IN (SELECT libraryID FROM libraries WHERE type = 'user')")
+    parameters = [library_id] if library_id is not None else []
+    if identifier.startswith('@'):
+        key = identifier[1:]
+        if not key:
+            raise ValueError('Empty citation key')
+        condition = """EXISTS (
+            SELECT 1 FROM itemData d
+            JOIN fieldsCombined f USING (fieldID)
+            JOIN itemDataValues v USING (valueID)
+            WHERE d.itemID = i.itemID AND (
+                (f.fieldName = 'citationKey' AND v.value = ?) OR
+                (f.fieldName = 'extra' AND has_citekey(v.value, ?))
+            ))"""
+        connection.create_function('has_citekey', 2, lambda extra, citekey: any(
+            re.fullmatch(r'Citation Key:\s*' + re.escape(citekey) + r'\s*', line, re.I)
+            for line in str(extra).splitlines()
+        ))
+        parameters += [key, key]
+    else:
+        condition = 'i.key = ?'
+        parameters.append(identifier)
+    items = connection.execute(f"""
+        SELECT i.itemID FROM items i WHERE {library} AND {condition}
+        AND NOT EXISTS (SELECT 1 FROM deletedItems x WHERE x.itemID = i.itemID)
+    """, parameters).fetchall()
+    if not items:
+        raise ValueError(f'Item not found: {identifier} (citation keys must be stored in Zotero)')
+    if len(items) > 1:
+        raise ValueError('Ambiguous citation key; use the Zotero item key instead')
+    item_id = items[0][0]
+    rows = connection.execute("""
+        SELECT i.key, a.path FROM itemAttachments a JOIN items i USING (itemID)
+        WHERE (a.parentItemID = ? OR a.itemID = ?) AND a.linkMode != 3
+        AND NOT EXISTS (SELECT 1 FROM deletedItems x WHERE x.itemID = a.itemID)
+        ORDER BY CASE WHEN a.contentType = 'application/pdf' THEN 0 ELSE 1 END, a.itemID
+    """, (item_id, item_id))
+    paths = []
+    for key, stored in rows:
+        if not stored:
+            continue
+        if stored.startswith('storage:'):
+            path = data / 'storage' / key / stored.removeprefix('storage:')
+        elif stored.startswith('attachments:'):
+            if base is None:
+                raise ValueError('Relative linked attachment requires --base-dir')
+            path = base / stored.removeprefix('attachments:')
+        else:
+            path = Path(stored)
+            if not path.is_absolute():
+                raise ValueError(f'Unsupported attachment path: {stored}')
+        if path.is_file():
+            paths.append(path)
+    if not paths:
+        raise ValueError('No local attachment found (it may need downloading in Zotero)')
+    return paths
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('id', help='@citationKey, Zotero item/attachment key, or select URI')
+    parser.add_argument('--data-dir', type=Path, help='Directory containing zotero.sqlite')
+    parser.add_argument('--prefs', type=Path, help='Zotero profile prefs.js')
+    parser.add_argument('--base-dir', type=Path, help='Base directory for linked attachments')
+    parser.add_argument('--library-id', type=int, help='Library ID (default: personal library)')
+    parser.add_argument('--all', action='store_true', help='Print all local attachments, PDFs first')
+    args = parser.parse_args()
+    try:
+        data, base = configuration(args)
+        with snapshot(data / 'zotero.sqlite') as connection:
+            paths = attachment_paths(connection, args.id, data, base, args.library_id)
+        for path in paths if args.all else paths[:1]:
+            print(path)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f'zotero-attachment: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
