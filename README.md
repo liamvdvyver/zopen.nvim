@@ -1,4 +1,4 @@
-# zopen
+# zopen.nvim
 
 _Lovingly vibecoded in 15 minutes, I make no guarantees of quality._
 
@@ -20,7 +20,7 @@ BibTeX) or as `Citation Key: ...` in Extra.
 With [lazy.nvim](https://github.com/folke/lazy.nvim).
 
 ```lua
-{ 'liamvdvyver/zopen', opts = {} }
+{ 'liamvdvyver/zopen.nvim', opts = {} }
 ```
 
 No mappings are installed automatically. The bundled lookup script is found
